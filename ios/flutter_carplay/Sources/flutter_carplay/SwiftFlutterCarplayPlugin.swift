@@ -1,0 +1,636 @@
+//
+//  SwiftFlutterCarplayPlugin.swift
+//  flutter_carplay
+//
+//  Created by Oğuzhan Atalay on 21.08.2021.
+//
+
+import CarPlay
+import Flutter
+
+@available(iOS 14.0, *)
+public class SwiftFlutterCarplayPlugin: NSObject, FlutterPlugin {
+  private static var streamHandler: FCPStreamHandlerPlugin?
+  private(set) static var registrar: FlutterPluginRegistrar?
+  private static var objcRootTemplate: FCPTemplate?
+  static var templateStack: [FCPTemplate] = []
+  private static var _rootTemplate: CPTemplate?
+  public static var animated: Bool = false
+  private var objcPresentTemplate: FCPPresentTemplate?
+
+  /// Signatures of the Now Playing buttons last pushed to CarPlay, so identical
+  /// updates can be dropped instead of triggering a redundant (flickering)
+  /// redraw. See the `updateNowPlayingButtons` handler.
+  fileprivate static var lastNowPlayingButtonSignatures: [String] = []
+
+  public static var rootTemplate: CPTemplate? {
+    get {
+      return _rootTemplate
+    }
+    set(tabBarTemplate) {
+      _rootTemplate = tabBarTemplate
+    }
+  }
+
+  public static func register(with registrar: FlutterPluginRegistrar) {
+    let channel = FlutterMethodChannel(
+      name: makeFCPChannelId(event: ""),
+      binaryMessenger: registrar.messenger())
+    let instance = SwiftFlutterCarplayPlugin()
+    registrar.addMethodCallDelegate(instance, channel: channel)
+    self.registrar = registrar
+
+    self.streamHandler = FCPStreamHandlerPlugin(registrar: registrar)
+  }
+
+  public static func sendOnScreenBackButtonPressed(elementId: String) {
+    FCPStreamHandlerPlugin.sendEvent(
+      type: FCPChannelTypes.onScreenBackButtonPressed, data: ["elementId": elementId])
+  }
+
+  /// Notifies Dart when the shared Now Playing template becomes the visible
+  /// top template (or stops being it). Lets the Dart side avoid rebuilding the
+  /// root template while Now Playing is on screen, which would otherwise reset
+  /// the navigation hierarchy out from under it.
+  public static func sendNowPlayingActiveChange(active: Bool) {
+    FCPStreamHandlerPlugin.sendEvent(
+      type: FCPChannelTypes.onNowPlayingActiveChange, data: ["active": active])
+  }
+
+  /// Notifies Dart that the user tapped the top-right "up next" button on the
+  /// shared Now Playing template, so the Dart side can push a queue list.
+  public static func sendNowPlayingUpNextButtonPressed() {
+    FCPStreamHandlerPlugin.sendEvent(
+      type: FCPChannelTypes.onNowPlayingUpNextButtonPressed, data: [:])
+  }
+
+  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case FCPChannelTypes.setRootTemplate:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      var rootTemplate: FCPTemplate?
+      var data = args["rootTemplate"] as? [String: Any] ?? [:]
+      var runtimeType = data["runtimeType"] as? String ?? ""
+
+      switch runtimeType {
+      case String(describing: FCPTabBarTemplate.self):
+        rootTemplate = FCPTabBarTemplate(obj: data)
+        let tabBarTemplate = rootTemplate as! FCPTabBarTemplate
+        if tabBarTemplate.getFCPTemplates().count > CPTabBarTemplate.maximumTabCount {
+          result(
+            FlutterError(
+              code: "ERROR",
+              message:
+                "CarPlay cannot have more than \(CPTabBarTemplate.maximumTabCount) templates on one screen.",
+              details: nil))
+          return
+        }
+        break
+      case String(describing: FCPGridTemplate.self):
+        rootTemplate = FCPGridTemplate(obj: data)
+        break
+      case String(describing: FCPInformationTemplate.self):
+        rootTemplate = FCPInformationTemplate(obj: data)
+        break
+      case String(describing: FCPPointOfInterestTemplate.self):
+        rootTemplate = FCPPointOfInterestTemplate(obj: data)
+        break
+      case String(describing: FCPListTemplate.self):
+        rootTemplate = FCPListTemplate(obj: data)
+        break
+      case String(describing: FCPSearchTemplate.self):
+        rootTemplate = FCPSearchTemplate(obj: data)
+        break
+      default:
+        result(false)
+        return
+      }
+
+      SwiftFlutterCarplayPlugin.rootTemplate = rootTemplate!.get
+      if !(SwiftFlutterCarplayPlugin.templateStack.isEmpty ?? true) {
+        SwiftFlutterCarplayPlugin.templateStack[0] = rootTemplate!
+      } else {
+        SwiftFlutterCarplayPlugin.templateStack = [rootTemplate!]
+      }
+      SwiftFlutterCarplayPlugin.objcRootTemplate = rootTemplate!
+      let animated = args["animated"] as! Bool
+      SwiftFlutterCarplayPlugin.animated = animated
+      FlutterCarPlaySceneDelegate.forceUpdateRootTemplate { completed, error in
+        result(completed && error == nil)
+      }
+      break
+    case FCPChannelTypes.forceUpdateRootTemplate:
+      FlutterCarPlaySceneDelegate.forceUpdateRootTemplate { completed, error in
+        result(completed && error == nil)
+      }
+      break
+    case FCPChannelTypes.updateListTemplateSections:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["elementId"] as! String
+      let sections = (args["sections"] as! [[String: Any]]).map {
+        FCPListSection(obj: $0)
+      }
+      FlutterCarPlaySceneDelegate.updateListTemplateSections(
+        elementId: elementId, sections: sections)
+      result(true)
+      break
+    case FCPChannelTypes.updateTabBarTemplates:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["elementId"] as! String
+      let templates = (args["templates"] as! [[String: Any]]).map {
+        FCPTabBarTemplate.parseTemplate(obj: $0)
+      }
+      if templates.count > CPTabBarTemplate.maximumTabCount {
+        result(
+          FlutterError(
+            code: "ERROR",
+            message:
+              "CarPlay cannot have more than \(CPTabBarTemplate.maximumTabCount) templates on one screen.",
+            details: nil))
+        return
+      }
+      FlutterCarPlaySceneDelegate.updateTabBarTemplates(elementId: elementId, templates: templates)
+      result(true)
+      break
+    case FCPChannelTypes.updateInformationTemplateItems:
+      guard let args = call.arguments as? [String : Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["elementId"] as! String
+      let items = (args["items"] as! Array<[String: Any]>).map {
+        FCPInformationItem(obj: $0)
+      }
+      FlutterCarPlaySceneDelegate.updateInformationTemplateItems(elementId: elementId, items: items)
+      result(true)
+      break
+    case FCPChannelTypes.updateInformationTemplateActions:
+      guard let args = call.arguments as? [String : Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["elementId"] as! String
+      let actions = (args["actions"] as! Array<[String: Any]>).map {
+        FCPTextButton(obj: $0)
+      }
+      FlutterCarPlaySceneDelegate.updateInformationTemplateActions(elementId: elementId, actions: actions)
+      result(true)
+      break
+    case FCPChannelTypes.updateListItem:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["_elementId"] as! String
+      SwiftFlutterCarplayPlugin.findListItem(
+        elementId: elementId,
+        actionWhenFound: { item in
+          if let listItem = item as? FCPListItem {
+            listItem.update(args: args)
+          } else {
+            NSLog("FCP: Found item is not an FCPListItem for elementId: \(elementId)")
+          }
+        })
+      result(true)
+      break
+    case FCPChannelTypes.updateListImageRowItem:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["_elementId"] as! String
+      SwiftFlutterCarplayPlugin.findListItem(
+        elementId: elementId,
+        actionWhenFound: { item in
+          if let listImageRowItem = item as? FCPListImageRowItem {
+            listImageRowItem.update(args: args)
+          } else {
+            NSLog("FCP: Found item is not an FCPListImageRowItem for elementId: \(elementId)")
+          }
+        })
+      result(true)
+      break
+
+    case FCPChannelTypes.updateListImageRowItemElement:
+      guard #available(iOS 26, *) else { break }
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["_elementId"] as! String
+
+      SwiftFlutterCarplayPlugin.findListImageRowItemElement(
+        elementId: elementId,
+        actionWhenFound: { item in
+          if let listImageRowItemElement = item as? FCPListImageRowItemElement {
+            listImageRowItemElement.update(args: args)
+          } else {
+            NSLog(
+              "FCP: Found item is not an FCPListImageRowItemElement for elementId: \(elementId)")
+          }
+        })
+      result(true)
+      break
+    case FCPChannelTypes.onListItemSelectedComplete:
+      guard let args = call.arguments as? String else {
+        result(false)
+        return
+      }
+      SwiftFlutterCarplayPlugin.findListItem(
+        elementId: args,
+        actionWhenFound: { item in
+          if let listItem = item as? FCPListItem {
+            listItem.stopHandler()
+          } else {
+            NSLog("FCP: Found item is not an FCPListItem for elementId: \(args)")
+          }
+        })
+      result(true)
+      break
+    case FCPChannelTypes.onListImageRowItemSelectedComplete:
+      guard let args = call.arguments as? String else {
+        result(false)
+        return
+      }
+      SwiftFlutterCarplayPlugin.findListItem(
+        elementId: args,
+        actionWhenFound: { item in
+          if let listItem = item as? FCPListImageRowItem {
+            listItem.stopHandler()
+          } else {
+            NSLog("FCP: Found item is not an FCPListImageRowItem for elementId: \(args)")
+          }
+        })
+      result(true)
+      break
+    case FCPChannelTypes.onListImageRowItemElementSelectedComplete:
+      guard let args = call.arguments as? String else {
+        result(false)
+        return
+      }
+      SwiftFlutterCarplayPlugin.findListItem(
+        elementId: args,
+        actionWhenFound: { item in
+          if let listItem = item as? FCPListImageRowItem {
+            listItem.stopItemHandler()
+          } else {
+            NSLog("FCP: Found item is not an FCPListImageRowItem for elementId: \(args)")
+          }
+        })
+      result(true)
+      break
+    case FCPChannelTypes.setAlert:
+      guard self.objcPresentTemplate == nil else {
+        result(
+          FlutterError(
+            code: "ERROR",
+            message: "CarPlay can only present one modal template at a time.",
+            details: nil))
+        return
+      }
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let alertTemplate = FCPAlertTemplate.init(obj: args["rootTemplate"] as! [String: Any])
+      self.objcPresentTemplate = alertTemplate
+      let animated = args["animated"] as! Bool
+      FlutterCarPlaySceneDelegate
+        .presentTemplate(
+          template: alertTemplate.get, animated: animated,
+          onPresent: { completed in
+            FCPStreamHandlerPlugin.sendEvent(
+              type: FCPChannelTypes.onPresentStateChanged,
+              data: ["completed": completed])
+          })
+      result(true)
+      break
+    case FCPChannelTypes.setActionSheet:
+      guard self.objcPresentTemplate == nil else {
+        result(
+          FlutterError(
+            code: "ERROR",
+            message: "CarPlay can only present one modal template at a time.",
+            details: nil))
+        return
+      }
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let actionSheetTemplate = FCPActionSheetTemplate.init(
+        obj: args["rootTemplate"] as! [String: Any])
+      self.objcPresentTemplate = actionSheetTemplate
+      let animated = args["animated"] as! Bool
+      FlutterCarPlaySceneDelegate.presentTemplate(
+        template: actionSheetTemplate.get, animated: animated, onPresent: { _ in })
+      result(true)
+      break
+    case FCPChannelTypes.popTemplate:
+      guard let args = call.arguments as? [String: Any],
+        SwiftFlutterCarplayPlugin.templateStack.count >= 2
+      else {
+        result(false)
+        return
+      }
+      for _ in 1...(args["count"] as! Int) {
+        FlutterCarPlaySceneDelegate.pop(animated: args["animated"] as! Bool)
+      }
+      result(true)
+      break
+    case FCPChannelTypes.closePresent:
+      guard let animated = call.arguments as? Bool else {
+        result(false)
+        return
+      }
+      FlutterCarPlaySceneDelegate.closePresent(animated: animated)
+      self.objcPresentTemplate = nil
+      result(true)
+      break
+    case FCPChannelTypes.showNowPlaying:
+      guard let animated = call.arguments as? Bool else {
+        result(false)
+        return
+      }
+      let template = FCPSharedNowPlayingTemplate()
+
+      let isCompleted = FlutterCarPlaySceneDelegate.pushIfNotExist(
+        template: template.get as CPTemplate, animated: animated)
+      if isCompleted {
+        SwiftFlutterCarplayPlugin.templateStack.append(template)
+        result(true)
+      } else {
+        result(false)
+      }
+      break
+    case FCPChannelTypes.updateNowPlayingButtons:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let buttons = (args["buttons"] as! [[String: Any]]).map {
+        FCPNowPlayingButton(obj: $0)
+      }
+      // Skip the redraw when nothing visually changed. Re-sending an identical
+      // button row still makes CarPlay re-render every button (a visible
+      // flicker), and looping playback can produce a stream of identical
+      // updates the Dart-side dedupe doesn't always catch.
+      let signatures = buttons.map { $0.signature }
+      if signatures == SwiftFlutterCarplayPlugin.lastNowPlayingButtonSignatures {
+        result(true)
+        break
+      }
+      SwiftFlutterCarplayPlugin.lastNowPlayingButtonSignatures = signatures
+      CPNowPlayingTemplate.shared.updateNowPlayingButtons(buttons.map { $0.get })
+      result(true)
+      break
+    case FCPChannelTypes.setArtworkPlaceholder:
+      guard let args = call.arguments as? [String: Any],
+        let bytes = args["imageData"] as? FlutterStandardTypedData,
+        let image = UIImage(data: bytes.data)
+      else {
+        result(false)
+        return
+      }
+      let kind = args["kind"] as? String ?? "default"
+      artworkPlaceholders[kind] = image
+      result(true)
+      break
+    case FCPChannelTypes.updateNowPlayingUpNextButton:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      let isEnabled = args["isEnabled"] as? Bool ?? false
+      let title = args["title"] as? String
+      CPNowPlayingTemplate.shared.isUpNextButtonEnabled = isEnabled
+      if let title = title {
+        CPNowPlayingTemplate.shared.upNextTitle = title
+      }
+      result(true)
+      break
+    case FCPChannelTypes.pushTemplate:
+      guard let args = call.arguments as? [String: Any] else {
+        result(false)
+        return
+      }
+      var template: FCPTemplate?
+      let animated = args["animated"] as! Bool
+      let data = args["template"] as? [String: Any] ?? [:]
+      let runtimeType = data["runtimeType"] as? String ?? ""
+
+      switch runtimeType {
+      case String(describing: FCPGridTemplate.self):
+        template = FCPGridTemplate(obj: data)
+        break
+      case String(describing: FCPPointOfInterestTemplate.self):
+        template = FCPPointOfInterestTemplate(obj: data)
+        break
+      case String(describing: FCPInformationTemplate.self):
+        template = FCPInformationTemplate(obj: data)
+        break
+      case String(describing: FCPListTemplate.self):
+        template = FCPListTemplate(obj: data)
+        break
+      case String(describing: FCPSearchTemplate.self):
+        template = FCPSearchTemplate(obj: data)
+        break
+      default:
+        result(false)
+        return
+      }
+
+      let isCompleted = FlutterCarPlaySceneDelegate.push(
+        template: template!.get, animated: animated)
+      if isCompleted {
+        SwiftFlutterCarplayPlugin.templateStack.append(template!)
+        result(true)
+      } else {
+        result(false)
+      }
+      break
+    case FCPChannelTypes.updateSearchResults:
+      guard let args = call.arguments as? [String : Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["elementId"] as! String
+      let items = (args["searchResults"] as! Array<[String : Any]>).map {
+        FCPListItem(obj: $0)
+      }
+      for template in SwiftFlutterCarplayPlugin.templateStack {
+        if let searchTemplate = template as? FCPSearchTemplate, searchTemplate.elementId == elementId {
+          searchTemplate.updateSearchResults(items: items)
+          break
+        }
+      }
+      result(true)
+      break
+    case FCPChannelTypes.onSearchResultSelectedComplete:
+      guard let args = call.arguments as? [String : Any] else {
+        result(false)
+        return
+      }
+      let elementId = args["elementId"] as! String
+      for template in SwiftFlutterCarplayPlugin.templateStack {
+        if let searchTemplate = template as? FCPSearchTemplate, searchTemplate.elementId == elementId {
+          searchTemplate.completeSelectedResult()
+          break
+        }
+      }
+      result(true)
+      break
+    case FCPChannelTypes.popToRootTemplate:
+      guard let animated = call.arguments as? Bool,
+        SwiftFlutterCarplayPlugin.templateStack.count >= 2
+      else {
+        result(false)
+        return
+      }
+
+      FlutterCarPlaySceneDelegate.popToRootTemplate(animated: animated)
+      self.objcPresentTemplate = nil
+      result(true)
+      break
+    case FCPChannelTypes.getMaximumNumberOfGridImages:
+      result(CPMaximumNumberOfGridImages)
+      break
+    case FCPChannelTypes.getMaximumSectionCount:
+      result(CPListTemplate.maximumSectionCount)
+      break
+    case FCPChannelTypes.getMaximumItemCount:
+      result(CPListTemplate.maximumItemCount)
+      break
+    default:
+      result(false)
+      break
+    }
+  }
+
+  static func createEventChannel(event: String?) -> FlutterEventChannel {
+    let eventChannel = FlutterEventChannel(
+      name: makeFCPChannelId(event: event),
+      binaryMessenger: SwiftFlutterCarplayPlugin.registrar!.messenger())
+    return eventChannel
+  }
+
+  static func onCarplayConnectionChange(status: String) {
+    // A disconnect tears down the shared Now Playing template, so forget the
+    // cached button signatures — the next session must re-push its buttons.
+    if status == FCPConnectionTypes.disconnected {
+      lastNowPlayingButtonSignatures = []
+    }
+    FCPStreamHandlerPlugin.sendEvent(
+      type: FCPChannelTypes.onCarplayConnectionChange,
+      data: ["status": status])
+  }
+
+  static func findListItem(
+    elementId: String, actionWhenFound: (_ item: FCPListTemplateItem) -> Void
+  ) {
+    var collected: [FCPListTemplate] = []
+    var found = false
+
+    for template in SwiftFlutterCarplayPlugin.templateStack {
+      if let tabBar = template as? FCPTabBarTemplate {
+        for child in tabBar.getFCPTemplates() {
+          if let listTemplate = child as? FCPListTemplate {
+            collected.append(listTemplate)
+          }
+        }
+      } else if let list = template as? FCPListTemplate {
+        collected.append(list)
+      } else if let search = template as? FCPSearchTemplate {
+        for item in search.getCurrentResultItems() {
+          if item.elementId == elementId {
+            actionWhenFound(item)
+            found = true
+          }
+        }
+      }
+    }
+
+    for t in collected {
+      for s in t.getFCPListSections() {
+        for i in s.getFCPListTemplateItems() {
+          if i.elementId == elementId {
+            actionWhenFound(i)
+            found = true
+          }
+        }
+      }
+    }
+
+    if !found {
+      NSLog("FCP: FCPListTemplateItem not found with elementId: \(elementId)")
+    }
+  }
+
+  @available(iOS 26.0, *)
+  static public func findListImageRowItemElement(
+    elementId: String, actionWhenFound: (_ item: FCPListImageRowItemElement) -> Void
+  ) {
+    var collected: [FCPListImageRowItemElement] = []
+
+    for template in SwiftFlutterCarplayPlugin.templateStack {
+      if let tabBar = template as? FCPTabBarTemplate {
+        for child in tabBar.getFCPTemplates() {
+          if let listTemplate = child as? FCPListTemplate {
+            for s in listTemplate.getFCPListSections() {
+              for i in s.getFCPListTemplateItems() {
+                if let imageRowItem = i as? FCPListImageRowItem {
+                  collected.append(
+                    contentsOf: imageRowItem.getFCPListImageRowItemElements()
+                  )
+                }
+              }
+            }
+          }
+        }
+      } else if let list = template as? FCPListTemplate {
+        for s in list.getFCPListSections() {
+          for i in s.getFCPListTemplateItems() {
+            if let imageRowItem = i as? FCPListImageRowItem {
+              collected.append(contentsOf: imageRowItem.getFCPListImageRowItemElements())
+            }
+          }
+        }
+      }
+    }
+
+    for element in collected {
+      if element.elementId == elementId {
+        actionWhenFound(element)
+        return
+      }
+    }
+    NSLog("FCP: FCPListImageRowItemElement not found with elementId: \(elementId)")
+  }
+
+  static public func getTemplateFromHistory(elementId: String) -> FCPTemplate? {
+    for i in 0..<SwiftFlutterCarplayPlugin.templateStack.count {
+      if SwiftFlutterCarplayPlugin.templateStack[i].elementId == elementId {
+        return SwiftFlutterCarplayPlugin.templateStack[i]
+      }
+
+      if let tabBar = SwiftFlutterCarplayPlugin.templateStack[i] as? FCPTabBarTemplate {
+        let subTemplates = tabBar.getFCPTemplates()
+        for j in 0..<subTemplates.count {
+          if subTemplates[j].elementId == elementId {
+            return subTemplates[j] as? FCPTemplate
+          }
+        }
+      }
+    }
+    return nil
+  }
+}

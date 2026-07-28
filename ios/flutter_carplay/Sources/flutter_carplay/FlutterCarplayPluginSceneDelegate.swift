@@ -1,0 +1,247 @@
+//
+//  FlutterCarPlayPluginsSceneDelegate.swift
+//  flutter_carplay
+//
+//  Created by Oğuzhan Atalay on 21.08.2021.
+//
+
+import CarPlay
+
+extension CPTemplate {
+  private static var elementIdKey: UInt8 = 0
+
+  var elementId: String? {
+    get {
+      return objc_getAssociatedObject(self, &CPTemplate.elementIdKey) as? String
+    }
+    set {
+      objc_setAssociatedObject(
+        self, &CPTemplate.elementIdKey, newValue, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+  }
+}
+
+@available(iOS 14.0, *)
+@objc(FlutterCarPlaySceneDelegate)
+class FlutterCarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegate,
+  CPInterfaceControllerDelegate, CPNowPlayingTemplateObserver
+{
+  static private var interfaceController: CPInterfaceController?
+
+  static public func forceUpdateRootTemplate(
+    completion: ((_ completed: Bool, _ error: Error?) -> Void)? = nil
+  ) {
+    guard let rootTemplate = SwiftFlutterCarplayPlugin.rootTemplate else {
+      completion?(true, nil)
+      return
+    }
+    let animated = SwiftFlutterCarplayPlugin.animated
+
+    guard let interfaceController = self.interfaceController else {
+      completion?(true, nil)
+      return
+    }
+
+    interfaceController.setRootTemplate(rootTemplate, animated: animated) { completed, error in
+      if let error = error {
+        NSLog(
+          "FlutterCarPlaySceneDelegate setRootTemplate failed: \(error.localizedDescription)"
+        )
+      }
+      completion?(completed, error)
+    }
+  }
+
+  // https://developer.apple.com/documentation/carplay/cplisttemplate/updatesections(_:)
+  static public func updateListTemplateSections(elementId: String, sections: [FCPListSection]) {
+    guard
+      let templateFromHistory = SwiftFlutterCarplayPlugin.getTemplateFromHistory(
+        elementId: elementId) as? FCPListTemplate
+    else {
+      NSLog(
+        "FlutterCarPlaySceneDelegate - updateListTemplateSections: Template from history with elementId \(elementId) not found."
+      )
+      return
+    }
+
+    templateFromHistory.updateSections(sections: sections)
+  }
+
+  static public func updateInformationTemplateItems(elementId: String, items: [FCPInformationItem]) {
+    guard let templateFromHistory = SwiftFlutterCarplayPlugin.getTemplateFromHistory(elementId: elementId) as? FCPInformationTemplate else {
+      NSLog("FlutterCarPlaySceneDelegate - updateInformationTemplateItems: Template from history with elementId \(elementId) not found.")
+      return
+    }
+
+    templateFromHistory.updateInformationItems(items: items)
+  }
+
+  static public func updateInformationTemplateActions(elementId: String, actions: [FCPTextButton]) {
+    guard let templateFromHistory = SwiftFlutterCarplayPlugin.getTemplateFromHistory(elementId: elementId) as? FCPInformationTemplate else {
+      NSLog("FlutterCarPlaySceneDelegate - updateInformationTemplateActions: Template from history with elementId \(elementId) not found.")
+      return
+    }
+
+    templateFromHistory.updateActions(actions: actions)
+  }
+
+  // https://developer.apple.com/documentation/carplay/cptabbartemplate/updatetemplates(_:)
+  static public func updateTabBarTemplates(elementId: String, templates: [FCPTemplate]) {
+    guard
+      let templateFromHistory = SwiftFlutterCarplayPlugin.getTemplateFromHistory(
+        elementId: elementId) as? FCPTabBarTemplate
+    else {
+      NSLog(
+        "FlutterCarPlaySceneDelegate - updateTabBarTemplates: TabBar template from history with elementId \(elementId) not found."
+      )
+      return
+    }
+
+    templateFromHistory.updateTemplates(templates: templates)
+  }
+
+  // Fired when just before the carplay become active
+  func sceneDidBecomeActive(_ scene: UIScene) {
+    SwiftFlutterCarplayPlugin.onCarplayConnectionChange(status: FCPConnectionTypes.connected)
+  }
+
+  // Fired when carplay entered background
+  func sceneDidEnterBackground(_ scene: UIScene) {
+    SwiftFlutterCarplayPlugin.onCarplayConnectionChange(status: FCPConnectionTypes.background)
+  }
+
+  static public func pop(animated: Bool) {
+    self.interfaceController?.popTemplate(animated: animated)
+  }
+
+  static public func popToRootTemplate(animated: Bool) {
+    self.interfaceController?.popToRootTemplate(animated: animated)
+  }
+
+  /// Pushes [template] and returns `true` synchronously once the push has been
+  /// requested. Deliberately does NOT wait on `pushTemplate`'s completion
+  /// handler: that callback is not reliably invoked by every head unit / in
+  /// every context (notably when pushing over the shared Now Playing screen),
+  /// which would leave the Dart caller awaiting forever and the pushed list
+  /// stuck on its loading view. The caller settles the slide-in animation
+  /// before filling sections on its own timer instead.
+  static public func push(template: CPTemplate, animated: Bool) -> Bool {
+    guard let interfaceController = self.interfaceController,
+      interfaceController.rootTemplate != nil
+    else {
+      return false
+    }
+
+    interfaceController.pushTemplate(template, animated: animated, completion: nil)
+    return true
+  }
+
+  static public func pushIfNotExist(template: CPTemplate, animated: Bool) -> Bool {
+    guard let interfaceController = self.interfaceController else { return false }
+    guard interfaceController.rootTemplate != nil else { return false }
+
+    let isAlreadyPushed = interfaceController.templates.contains { $0 === template }
+    let isTopSameInstance = interfaceController.topTemplate === template
+
+    if !isAlreadyPushed && !isTopSameInstance {
+      interfaceController.pushTemplate(template, animated: animated)
+      return true
+    }
+    return false
+  }
+
+  func templateDidAppear(_ template: CPTemplate, animated: Bool) {
+    if template is CPNowPlayingTemplate {
+      SwiftFlutterCarplayPlugin.sendNowPlayingActiveChange(active: true)
+    }
+  }
+
+  func templateDidDisappear(_ template: CPTemplate, animated: Bool) {
+    if template is CPNowPlayingTemplate {
+      SwiftFlutterCarplayPlugin.sendNowPlayingActiveChange(active: false)
+    }
+
+    guard let interfaceController = FlutterCarPlaySceneDelegate.interfaceController else { return }
+
+    let currentTemplates = interfaceController.templates
+
+    SwiftFlutterCarplayPlugin.templateStack.removeAll { stackTemplate in
+      if !currentTemplates.contains(where: { $0.elementId == stackTemplate.elementId }) {
+        SwiftFlutterCarplayPlugin.sendOnScreenBackButtonPressed(elementId: stackTemplate.elementId)
+        return true
+      }
+      return false
+    }
+  }
+
+  static public func closePresent(animated: Bool) {
+    self.interfaceController?.dismissTemplate(animated: animated)
+  }
+
+  static public func presentTemplate(
+    template: CPTemplate, animated: Bool,
+    onPresent: @escaping (_ completed: Bool) -> Void
+  ) {
+    self.interfaceController?.presentTemplate(
+      template, animated: animated,
+      completion: { completed, error in
+        if error != nil {
+          onPresent(false)
+          return
+        }
+        onPresent(completed)
+      })
+  }
+
+  func templateApplicationScene(
+    _ templateApplicationScene: CPTemplateApplicationScene,
+    didConnect interfaceController: CPInterfaceController
+  ) {
+    FlutterCarPlaySceneDelegate.interfaceController = interfaceController
+    interfaceController.delegate = self
+    // Observe the shared Now Playing template so taps on its top-right "up next"
+    // button reach Dart (see `nowPlayingTemplateUpNextButtonTapped`).
+    CPNowPlayingTemplate.shared.add(self)
+
+    SwiftFlutterCarplayPlugin.onCarplayConnectionChange(status: FCPConnectionTypes.connected)
+    if let rootTemplate = SwiftFlutterCarplayPlugin.rootTemplate {
+      interfaceController.setRootTemplate(
+        rootTemplate, animated: SwiftFlutterCarplayPlugin.animated
+      ) { completed, error in
+        if let error = error {
+          NSLog(
+            "FlutterCarPlaySceneDelegate didConnect setRootTemplate failed: \(error.localizedDescription)"
+          )
+        }
+      }
+    }
+  }
+
+  func templateApplicationScene(
+    _ templateApplicationScene: CPTemplateApplicationScene,
+    didDisconnect interfaceController: CPInterfaceController, from window: CPWindow
+  ) {
+    SwiftFlutterCarplayPlugin.onCarplayConnectionChange(status: FCPConnectionTypes.disconnected)
+
+    CPNowPlayingTemplate.shared.remove(self)
+    interfaceController.delegate = nil
+    FlutterCarPlaySceneDelegate.interfaceController = nil
+  }
+
+  func templateApplicationScene(
+    _ templateApplicationScene: CPTemplateApplicationScene,
+    didDisconnectInterfaceController interfaceController: CPInterfaceController
+  ) {
+    SwiftFlutterCarplayPlugin.onCarplayConnectionChange(status: FCPConnectionTypes.disconnected)
+
+    CPNowPlayingTemplate.shared.remove(self)
+    interfaceController.delegate = nil
+    FlutterCarPlaySceneDelegate.interfaceController = nil
+  }
+
+  // MARK: - CPNowPlayingTemplateObserver
+
+  func nowPlayingTemplateUpNextButtonTapped(_ nowPlayingTemplate: CPNowPlayingTemplate) {
+    SwiftFlutterCarplayPlugin.sendNowPlayingUpNextButtonPressed()
+  }
+}
