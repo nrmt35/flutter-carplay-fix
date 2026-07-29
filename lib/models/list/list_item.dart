@@ -69,6 +69,19 @@ class CPListItem extends CPListTemplateItem {
   /// iOS 14.0+ | iPadOS 14.0+ | Mac Catalyst 14.0+
   CPListItemAccessoryType? accessoryType;
 
+  /// Whether the row shows the built-in "downloaded" (cloud) badge in its
+  /// trailing region.
+  ///
+  /// Shows CarPlay's own [CPListItemAccessoryType.cloud] accessory, which the
+  /// system draws at the slot's full size, centered on the row, and tinted with
+  /// the row's label color in both day and night mode. Prefer this over
+  /// supplying your own [trailingImage] for a downloaded indicator: an image
+  /// asset is fit into a smaller box that sits low against the detail text.
+  ///
+  /// Takes precedence over [accessoryType], and is ignored when [trailingImage]
+  /// or [accessoryImage] is set — those occupy the same slot.
+  bool isDownloaded;
+
   /// An optional closure that CarPlay invokes when the user selects the list item.
   /// iOS 14.0+ | iPadOS 14.0+ | Mac Catalyst 14.0+
   final FutureOr<void> Function(Function() complete, CPListItem self)? onPress;
@@ -92,6 +105,7 @@ class CPListItem extends CPListTemplateItem {
     this.isPlaying,
     this.playingIndicatorLocation,
     this.accessoryType,
+    this.isDownloaded = false,
     String? id,
   }) : _elementId = id ?? const Uuid().v4();
 
@@ -111,6 +125,7 @@ class CPListItem extends CPListTemplateItem {
         'isPlaying': isPlaying,
         'playingIndicatorLocation': playingIndicatorLocation?.name,
         'accessoryType': accessoryType?.name,
+        'isDownloaded': isDownloaded,
         'runtimeType': 'FCPListItem',
       };
 
@@ -199,6 +214,12 @@ class CPListItem extends CPListTemplateItem {
     FlutterCarPlayController.updateCPListItem(this);
   }
 
+  /// Setter for isDownloaded
+  void setIsDownloaded(bool isDownloaded) {
+    this.isDownloaded = isDownloaded;
+    FlutterCarPlayController.updateCPListItem(this);
+  }
+
   void update({
     String? text,
     String? detailText,
@@ -211,6 +232,7 @@ class CPListItem extends CPListTemplateItem {
     bool? isPlaying,
     CPListItemPlayingIndicatorLocation? playingIndicatorLocation,
     CPListItemAccessoryType? accessoryType,
+    bool? isDownloaded,
   }) {
     if (text != null) this.text = text;
     if (detailText != null) this.detailText = detailText;
@@ -231,6 +253,7 @@ class CPListItem extends CPListTemplateItem {
       this.playingIndicatorLocation = playingIndicatorLocation;
     }
     if (accessoryType != null) this.accessoryType = accessoryType;
+    if (isDownloaded != null) this.isDownloaded = isDownloaded;
 
     FlutterCarPlayController.updateCPListItem(this);
   }

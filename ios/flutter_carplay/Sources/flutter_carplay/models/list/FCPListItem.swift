@@ -28,6 +28,7 @@ final class FCPListItem {
   private var isPlaying: Bool?
   private var playingIndicatorLocation: CPListItemPlayingIndicatorLocation?
   private var accessoryType: CPListItemAccessoryType?
+  private var isDownloaded: Bool = false
 
   init(obj: [String: Any]) {
     self.elementId = obj["_elementId"] as! String
@@ -46,6 +47,7 @@ final class FCPListItem {
     self.isPlaying = obj["isPlaying"] as? Bool
     self.setPlayingIndicatorLocation(fromString: obj["playingIndicatorLocation"] as? String)
     self.setAccessoryType(fromString: obj["accessoryType"] as? String)
+    self.isDownloaded = obj["isDownloaded"] as? Bool ?? false
   }
 
   private func handler(selectedItem: CPSelectableListItem, complete: @escaping () -> Void) {
@@ -92,8 +94,8 @@ final class FCPListItem {
     if playingIndicatorLocation != nil {
       listItem.playingIndicatorLocation = playingIndicatorLocation!
     }
-    if accessoryType != nil && accessorySource == nil {
-      listItem.accessoryType = accessoryType!
+    if accessorySource == nil {
+      listItem.accessoryType = resolvedAccessoryType()
     }
     self._super = listItem
     return listItem
@@ -121,6 +123,7 @@ final class FCPListItem {
     let isPlaying = args["isPlaying"] as? Bool
     let playingIndicatorLocation = args["playingIndicatorLocation"] as? String
     let accessoryType = args["accessoryType"] as? String
+    let isDownloaded = args["isDownloaded"] as? Bool
 
     if text != nil {
       self._super?.setText(text!)
@@ -155,6 +158,9 @@ final class FCPListItem {
     if let requestedAccessoryImage = requestedAccessoryImage,
       requestedAccessoryImage != currentAccessoryImage || trailingImageTintChanged
     {
+      // An explicit image owns the slot, so give up whatever accessory type the
+      // row was drawing there — the two would otherwise compete for it.
+      self._super?.accessoryType = .none
       self._super?.setAccessoryImage(makeSafeUIPlaceholder())
       loadUIImage(
         from: requestedAccessoryImage,
@@ -174,7 +180,21 @@ final class FCPListItem {
       self.trailingImage = nil
       self.trailingImageData = nil
       self.trailingImageTint = nil
+      // Fall back to the cloud badge rather than clearing the slot when the row
+      // is still marked downloaded — otherwise dropping a trailing image would
+      // silently drop the badge with it.
       self._super?.setAccessoryImage(nil)
+      self._super?.accessoryType = self.resolvedAccessoryType()
+    }
+
+    // Only owns the accessory slot when no explicit image is set. A track that
+    // finishes downloading while its list is on screen arrives as an update, so
+    // the badge has to be applied here and not just in `get`.
+    if let isDownloaded = isDownloaded, isDownloaded != self.isDownloaded {
+      self.isDownloaded = isDownloaded
+      if (self.trailingImage ?? self.accessoryImage) == nil {
+        self._super?.accessoryType = self.resolvedAccessoryType()
+      }
     }
 
     if playbackProgress != nil {
@@ -191,12 +211,26 @@ final class FCPListItem {
         self._super?.playingIndicatorLocation = self.playingIndicatorLocation!
       }
     }
-    if accessoryType != nil && (self.trailingImage ?? self.accessoryImage) == nil {
+    if accessoryType != nil {
       self.setAccessoryType(fromString: accessoryType)
-      if self.accessoryType != nil {
-        self._super?.accessoryType = self.accessoryType!
+      if (self.trailingImage ?? self.accessoryImage) == nil {
+        self._super?.accessoryType = self.resolvedAccessoryType()
       }
     }
+  }
+
+  /// The accessory CarPlay should draw in the trailing slot, with the
+  /// downloaded badge taking precedence over any type set from Dart.
+  ///
+  /// The badge is the system `.cloud` accessory rather than an image of a
+  /// cloud: CarPlay draws that one itself, at the slot's full size and centered
+  /// on the row, whereas an accessory image is fit into a smaller box that sits
+  /// low against the detail text.
+  private func resolvedAccessoryType() -> CPListItemAccessoryType {
+    if isDownloaded {
+      return .cloud
+    }
+    return accessoryType ?? .none
   }
 
   private func setPlayingIndicatorLocation(fromString: String?) {
