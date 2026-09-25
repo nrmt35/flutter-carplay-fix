@@ -40,14 +40,22 @@ class FlutterCarPlayController {
     return _eventChannel;
   }
 
+  /// [beforeInvoke] runs immediately before the payload goes over the method
+  /// channel. Callers that mirror native state (e.g. which template is the
+  /// root) use it so their bookkeeping lands in the same order the native side
+  /// applies the calls: awaiting the *result* instead can reorder two
+  /// in-flight calls, and the SVG rasterization below can reorder their sends.
   static Future<bool?> flutterToNativeModule(
     FCPChannelTypes type, [
     dynamic data,
+    void Function()? beforeInvoke,
   ]) async {
     // Rasterize any Flutter asset SVGs referenced by image fields into PNG
     // bytes before sending the payload to the native side, which cannot render
     // SVG directly. Non-collection payloads pass through unchanged.
     await resolveSvgInPayload(data, size: FlutterCarplay.svgRasterSize);
+
+    beforeInvoke?.call();
 
     final value = await _methodChannel.invokeMethod<bool>(
       type.name,
@@ -240,7 +248,15 @@ class FlutterCarPlayController {
       templates: templateHistory,
       elementId: elementId,
     );
-    if (item is! CPListItem) return;
+    if (item is! CPListItem) {
+      // The row was replaced before this tap was handled (e.g. its list was
+      // updated in the meantime). Still release the native selection —
+      // otherwise CarPlay keeps the row's spinner running indefinitely and
+      // the tap looks like it hung.
+      await flutterToNativeModule(
+          FCPChannelTypes.onFCPListItemSelectedComplete, elementId);
+      return;
+    }
 
     Future<void> complete() async {
       await flutterToNativeModule(

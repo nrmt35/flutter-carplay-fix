@@ -5,6 +5,7 @@
 //  Created by Oğuzhan Atalay on 21.08.2021.
 //
 
+import CarPlay
 import Flutter
 import UIKit
 
@@ -19,19 +20,27 @@ func makeUIImage(fromBytes data: FlutterStandardTypedData?) -> UIImage? {
   return UIImage(data: data.data)
 }
 
+/// [maxSize] (points), when given, shrinks the loaded image to fit it at the
+/// screen scale before it is cached and delivered — see
+/// `UIImage.downscaled(toFit:scale:)` for why that matters.
 @available(iOS 14.0, *)
 func loadUIImage(
   from imagePath: String,
   bytes imageData: FlutterStandardTypedData?,
   tint imageTint: FCPImageTint? = nil,
   placeholderKind: String? = nil,
+  maxSize: CGSize? = nil,
   completion: @escaping (UIImage) -> Void
 ) {
-  let cacheKey = makeImageCacheKey(imagePath: imagePath, imageData: imageData, tint: imageTint)
+  var cacheKey = makeImageCacheKey(imagePath: imagePath, imageData: imageData, tint: imageTint)
+  if let maxSize = maxSize {
+    cacheKey += "|\(maxSize.width)x\(maxSize.height)"
+  }
   if let cachedImage = fcpTintedImageCache.object(forKey: cacheKey as NSString) {
     completion(cachedImage)
     return
   }
+  let scale = UIScreen.main.scale
 
   func complete(_ image: UIImage, cache: Bool) {
     let result = image.applyingImageTint(imageTint)
@@ -42,7 +51,7 @@ func loadUIImage(
   }
 
   if let bytesImage = makeUIImage(fromBytes: imageData) {
-    complete(bytesImage, cache: true)
+    complete(bytesImage.downscaled(toFit: maxSize, scale: scale), cache: true)
     return
   }
 
@@ -55,6 +64,8 @@ func loadUIImage(
   loadUIImageAsync(
     from: imagePath.toImageSource(),
     placeholderKind: placeholderKind,
+    fitting: maxSize,
+    scale: scale,
     completion: { uiImage in
       guard let uiImage = uiImage else { return }
       complete(uiImage, cache: !loadFailed)
@@ -156,6 +167,30 @@ private func registeredArtworkPlaceholder(kind: String?) -> UIImage? {
     return image
   }
   return artworkPlaceholders["default"]
+}
+
+/// Artwork placeholders already shrunk to a slot's size, keyed by kind and
+/// size and remembering the image they were made from, so re-registering a
+/// placeholder refreshes them.
+private var fittedArtworkPlaceholders: [String: (source: UIImage, fitted: UIImage)] = [:]
+
+/// `makeArtworkPlaceholder(kind:)` shrunk to fit [maxSize] points, e.g.
+/// `CPListItem.maximumImageSize`. Every list row still loading (or failing to
+/// load) its cover shows this, and handing CarPlay the full-size placeholder
+/// cost ~2ms of main-thread resizing per row (see `UIImage.downscaled`).
+/// Main thread only.
+func makeArtworkPlaceholder(kind: String?, fitting maxSize: CGSize) -> UIImage {
+  let key = "\(kind ?? "")|\(maxSize.width)x\(maxSize.height)"
+  let registered = registeredArtworkPlaceholder(kind: kind)
+  if let cached = fittedArtworkPlaceholders[key],
+    registered == nil || cached.source === registered
+  {
+    return cached.fitted
+  }
+  let source = registered ?? makeArtworkPlaceholder(kind: kind)
+  let fitted = source.downscaled(toFit: maxSize, scale: UIScreen.main.scale)
+  fittedArtworkPlaceholders[key] = (source, fitted)
+  return fitted
 }
 
 /// Visible fallback for *artwork* that is loading or failed to download (a
@@ -263,10 +298,15 @@ func makeUIImage(
 }
 
 // Asynchronous image loader. Always calls completion on main thread.
+// [maxSize] (points, at [scale]) shrinks downloaded/file images on the
+// background queue that loaded them, so the main thread never decodes or
+// resizes the full-size original.
 @available(iOS 14.0, *)
 func loadUIImageAsync(
   from source: ImageSource,
   placeholderKind: String? = nil,
+  fitting maxSize: CGSize? = nil,
+  scale: CGFloat = 1,
   completion: @escaping (UIImage?) -> Void,
   errorCallback: ((Error) -> Void)? = nil
 ) {
@@ -280,13 +320,16 @@ func loadUIImageAsync(
             domain: "ImageLoadError", code: 0,
             userInfo: [NSLocalizedDescriptionKey: "Invalid image data"])
         }
-        DispatchQueue.main.async { completion(image) }
+        let fitted = image.downscaled(toFit: maxSize, scale: scale)
+        DispatchQueue.main.async { completion(fitted) }
       } catch {
         DispatchQueue.main.async {
           errorCallback?(error)
           // Network fetch failed — show the visible artwork placeholder
           // instead of leaving the slot empty.
-          completion(makeArtworkPlaceholder(kind: placeholderKind))
+          completion(
+            maxSize.map { makeArtworkPlaceholder(kind: placeholderKind, fitting: $0) }
+              ?? makeArtworkPlaceholder(kind: placeholderKind))
         }
       }
     }
@@ -300,7 +343,8 @@ func loadUIImageAsync(
             domain: "ImageLoadError", code: 1,
             userInfo: [NSLocalizedDescriptionKey: "File not found or invalid"])
         }
-        DispatchQueue.main.async { completion(image) }
+        let fitted = image.downscaled(toFit: maxSize, scale: scale)
+        DispatchQueue.main.async { completion(fitted) }
       } catch {
         DispatchQueue.main.async {
           errorCallback?(error)
@@ -346,7 +390,7 @@ func loadUIImageAsync(
             domain: "ImageLoadError", code: 4,
             userInfo: [NSLocalizedDescriptionKey: "Failed to decode image at path: \(path)"])
         }
-        completion(image)
+        completion(image.downscaled(toFit: maxSize, scale: scale))
       } catch {
         errorCallback?(error)
         completion(makeUIPlaceholder())
@@ -357,6 +401,28 @@ func loadUIImageAsync(
 
 //  UIImage utilities (safe, UI only)
 extension UIImage {
+  /// A copy that fits within [maxSize] points at [scale], or `self` when it
+  /// already fits or no size is given. Safe off the main thread.
+  ///
+  /// CarPlay shrinks every image handed to `CPListItem.setImage` to the row's
+  /// maximum size on the calling (main) thread, decoding the original each
+  /// time: ~7ms per row for a 600px cover, so a few hundred rows stalled the
+  /// main thread — and with it the Now Playing screen and row taps — for
+  /// seconds. Shrinking once, off the main thread, before caching makes each
+  /// later `setImage` ~0.7ms.
+  func downscaled(toFit maxSize: CGSize?, scale: CGFloat) -> UIImage {
+    guard let maxSize = maxSize, size.width > 0, size.height > 0 else { return self }
+    let ratio = min(maxSize.width / size.width, maxSize.height / size.height)
+    guard ratio < 1 else { return self }
+    let target = CGSize(width: size.width * ratio, height: size.height * ratio)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = scale
+    format.opaque = false
+    return UIGraphicsImageRenderer(size: target, format: format).image { _ in
+      draw(in: CGRect(origin: .zero, size: target))
+    }.withRenderingMode(renderingMode)
+  }
+
   func resizeImageTo(size: CGSize) -> UIImage {
     let renderer = UIGraphicsImageRenderer(size: size)
     return renderer.image { _ in

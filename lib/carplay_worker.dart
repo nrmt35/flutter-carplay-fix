@@ -279,18 +279,42 @@ class FlutterCarplay {
         rootTemplate is CPInformationTemplate ||
         rootTemplate is CPPointOfInterestTemplate ||
         rootTemplate is CPSearchTemplate) {
+      final history = FlutterCarPlayController.templateHistory;
+      final previousRoot = history.isEmpty ? null : history[0];
+
+      // Record the new root as the call is sent, not when it comes back: the
+      // native side swaps the root in the moment it receives this call, no
+      // matter what CarPlay then reports for the on-screen transition (which
+      // fails e.g. while another root swap is still animating on a cold
+      // start). Waiting for the result — and only keeping it on success — left
+      // Dart holding the *previous* template's element ids, so every tap on a
+      // row reported an id Dart could not find and was silently dropped.
+      void recordRoot() {
+        if (history.isEmpty) {
+          history.add(rootTemplate);
+        } else {
+          history[0] = rootTemplate;
+        }
+      }
+
       return FlutterCarPlayController.flutterToNativeModule(
-          FCPChannelTypes.setRootTemplate, <String, dynamic>{
-        'rootTemplate': rootTemplate.toJson(),
-        'animated': animated,
-      }).then((value) {
-        if (value == true) {
-          if (FlutterCarPlayController.templateHistory.isEmpty) {
-            FlutterCarPlayController.templateHistory.add(rootTemplate);
+        FCPChannelTypes.setRootTemplate,
+        <String, dynamic>{
+          'rootTemplate': rootTemplate.toJson(),
+          'animated': animated,
+        },
+        recordRoot,
+      ).then((_) {}, onError: (Object error, StackTrace stackTrace) {
+        // Native refused the template (e.g. more tabs than CarPlay allows) and
+        // kept the old root, so undo the bookkeeping above.
+        if (history.isNotEmpty && identical(history[0], rootTemplate)) {
+          if (previousRoot == null) {
+            history.removeAt(0);
           } else {
-            FlutterCarPlayController.templateHistory[0] = rootTemplate;
+            history[0] = previousRoot;
           }
         }
+        Error.throwWithStackTrace(error, stackTrace);
       });
     } else {
       throw TypeError();
@@ -309,22 +333,21 @@ class FlutterCarplay {
     required String elementId,
     required List<CPListSection> sections,
   }) async {
-    final bool? isCompleted =
-        await FlutterCarPlayController.flutterToNativeModule(
+    await FlutterCarPlayController.flutterToNativeModule(
       FCPChannelTypes.updateListTemplateSections,
       <String, dynamic>{
         'elementId': elementId,
         'sections':
             sections.map((CPListSection section) => section.toJson()).toList(),
       },
+      // Mirror the native update as the call is sent, for the same reason as
+      // `setRootTemplate`: two in-flight updates of the same list must not
+      // land here in the opposite order, or Dart ends up holding element ids
+      // the rows on screen no longer carry and taps are dropped.
+      () => FlutterCarPlayController.getTemplateFromHistory<CPListTemplate>(
+        elementId,
+      )?.updateSections(sections),
     );
-
-    if (isCompleted == true) {
-      final template =
-          FlutterCarPlayController.getTemplateFromHistory<CPListTemplate>(
-              elementId);
-      template?.updateSections(sections);
-    }
     return;
   }
 

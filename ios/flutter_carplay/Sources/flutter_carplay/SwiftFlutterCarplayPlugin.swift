@@ -23,6 +23,28 @@ public class SwiftFlutterCarplayPlugin: NSObject, FlutterPlugin {
   /// redraw. See the `updateNowPlayingButtons` handler.
   fileprivate static var lastNowPlayingButtonSignatures: [String] = []
 
+  /// The Now Playing buttons currently on screen, so unchanged ones can be
+  /// reused (keeping their CarPlay identifiers) when the row is re-sent. See
+  /// the `updateNowPlayingButtons` handler.
+  fileprivate static var liveNowPlayingButtons: [FCPNowPlayingButton] = []
+
+  /// `updateNowPlayingButtons` always goes out throttled: the CarPlay host
+  /// stores the new row but skips redrawing it when another throttled update
+  /// came within its window (`CPUIThrottle`: 2s base, doubling, 4–20s), and
+  /// nothing redraws it afterwards — so an icon change (heart, echo, repeat
+  /// one) could stay stale until something else refreshed Now Playing.
+  /// Template setters are sent unthrottled whenever their value changes and
+  /// carry the whole template, buttons included, so flipping one and straight
+  /// back makes the host redraw the current row. The album/artist button is
+  /// otherwise unused; both flips reach the host back to back, so the
+  /// in-between state should never be drawn.
+  fileprivate static func forceNowPlayingRedraw() {
+    let template = CPNowPlayingTemplate.shared
+    let enabled = template.isAlbumArtistButtonEnabled
+    template.isAlbumArtistButtonEnabled = !enabled
+    template.isAlbumArtistButtonEnabled = enabled
+  }
+
   public static var rootTemplate: CPTemplate? {
     get {
       return _rootTemplate
@@ -390,7 +412,24 @@ public class SwiftFlutterCarplayPlugin: NSObject, FlutterPlugin {
         break
       }
       SwiftFlutterCarplayPlugin.lastNowPlayingButtonSignatures = signatures
-      CPNowPlayingTemplate.shared.updateNowPlayingButtons(buttons.map { $0.get })
+
+      // Always send the whole row, even when only a selection changed (e.g.
+      // shuffle toggled): the CarPlay host keeps its own copy of each button
+      // and re-applies it on every Now Playing reload (track change,
+      // play/pause), so flipping `isSelected` on the on-screen button alone
+      // was undone on the next track. What stops the other buttons blinking
+      // is reusing the live buttons whose image is unchanged: same CarPlay
+      // identifiers, so the host keeps their on-screen views. Only a button
+      // whose image changed gets a new instance.
+      let live = SwiftFlutterCarplayPlugin.liveNowPlayingButtons
+      let next = buttons.enumerated().map { index, new in
+        guard index < live.count, live[index].canTakeOver(new) else { return new }
+        live[index].takeOver(new)
+        return live[index]
+      }
+      SwiftFlutterCarplayPlugin.liveNowPlayingButtons = next
+      CPNowPlayingTemplate.shared.updateNowPlayingButtons(next.map { $0._super ?? $0.get })
+      SwiftFlutterCarplayPlugin.forceNowPlayingRedraw()
       result(true)
       break
     case FCPChannelTypes.setArtworkPlaceholder:
@@ -528,6 +567,7 @@ public class SwiftFlutterCarplayPlugin: NSObject, FlutterPlugin {
     // cached button signatures — the next session must re-push its buttons.
     if status == FCPConnectionTypes.disconnected {
       lastNowPlayingButtonSignatures = []
+      liveNowPlayingButtons = []
     }
     FCPStreamHandlerPlugin.sendEvent(
       type: FCPChannelTypes.onCarplayConnectionChange,

@@ -12,7 +12,11 @@ class FCPListSection {
   private(set) var _super: CPListSection?
   private(set) var elementId: String
   private var header: String?
-  private var items: [CPListTemplateItem]
+  // Built on the first `get` rather than at parse time, so
+  // `reuseUnchangedItems` can swap in live rows first. Building a row sets its
+  // image, which CarPlay resizes synchronously on the main thread — for a
+  // few hundred rows that's around a second.
+  private var items: [CPListTemplateItem]?
   private var objcItems: [FCPListTemplateItem]
   private var sectionIndexEnabled: Bool
 
@@ -37,13 +41,12 @@ class FCPListSection {
         fatalError("FCPListSection.init: Unknown item runtimeType: \(runtimeType)")
       }
     }
-    self.items = self.objcItems.map {
-      $0.get
-    }
   }
 
   var get: CPListSection {
     let sectionIndexTitle = sectionIndexEnabled ? header : nil
+    let items = self.items ?? objcItems.map { $0.get }
+    self.items = items
 
     let listSection = CPListSection.init(
       items: items, header: header, sectionIndexTitle: sectionIndexTitle)
@@ -54,5 +57,42 @@ class FCPListSection {
 
   public func getFCPListTemplateItems() -> [FCPListTemplateItem] {
     return objcItems
+  }
+
+  /// Replaces each not-yet-built row in [newSections] that renders
+  /// identically to a live row in [oldSections] with that live row (which
+  /// adopts the new row's element id), so an update only builds rows whose
+  /// content actually changed. Dart re-sends whole lists for any change — a
+  /// favorite toggled, covers resolved, a download finished — and rebuilding
+  /// every row each time blocked the main thread long enough to stall the Now
+  /// Playing screen. Each live row is handed out at most once.
+  static func reuseUnchangedItems(in newSections: [FCPListSection], from oldSections: [FCPListSection]) {
+    var live: [String: [FCPListItem]] = [:]
+    for section in oldSections {
+      for case let item as FCPListItem in section.objcItems where item._super != nil {
+        live[item.contentKey, default: []].append(item)
+      }
+    }
+    guard !live.isEmpty else { return }
+
+    for section in newSections where section.items == nil {
+      var built: [CPListTemplateItem] = []
+      section.objcItems = section.objcItems.map { item in
+        guard let new = item as? FCPListItem,
+          let candidates = live[new.contentKey],
+          let index = candidates.firstIndex(where: { $0.hasSameContent(as: new) }),
+          let liveItem = candidates[index]._super
+        else {
+          built.append(item.get)
+          return item
+        }
+        let old = candidates[index]
+        live[new.contentKey]!.remove(at: index)
+        old.adoptIdentity(of: new)
+        built.append(liveItem)
+        return old
+      }
+      section.items = built
+    }
   }
 }

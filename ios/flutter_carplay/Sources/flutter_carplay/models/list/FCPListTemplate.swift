@@ -110,6 +110,7 @@ class FCPListTemplate {
       uniqueKeysWithValues: zip(self.objcSections.map { $0.elementId }, self.sections))
 
     /// CPListSection didn't provide any way to update items
+    FCPListSection.reuseUnchangedItems(in: sections, from: self.objcSections)
     self.objcSections = sections
     self.sections = sections.map { section in
       return section.get

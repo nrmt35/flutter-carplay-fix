@@ -69,11 +69,7 @@ final class FCPListItem {
     let listItem = CPListItem.init(text: text, detailText: detailText)
     listItem.handler = self.handler
     if image != nil {
-      listItem.setImage(makeSafeArtworkPlaceholder(kind: placeholderKind))
-      loadUIImage(from: image!, bytes: imageData, tint: imageTint, placeholderKind: placeholderKind)
-      { uiImage in
-        listItem.setImage(uiImage)
-      }
+      setArtwork(on: listItem, from: image!, bytes: imageData, tint: imageTint)
     }
 
     let accessorySource = trailingImage ?? accessoryImage
@@ -101,12 +97,70 @@ final class FCPListItem {
     return listItem
   }
 
+  /// Sets the row's artwork, shrunk to `CPListItem.maximumImageSize` (see
+  /// `UIImage.downscaled`). Art already in the cache arrives synchronously and
+  /// is set directly; only rows still loading get the placeholder first —
+  /// each `setImage` costs main-thread time, so a list of cached rows no
+  /// longer pays for two.
+  private func setArtwork(
+    on listItem: CPListItem, from image: String, bytes: FlutterStandardTypedData?,
+    tint: FCPImageTint?
+  ) {
+    var delivered = false
+    loadUIImage(
+      from: image, bytes: bytes, tint: tint, placeholderKind: placeholderKind,
+      maxSize: CPListItem.maximumImageSize
+    ) { uiImage in
+      delivered = true
+      listItem.setImage(uiImage)
+    }
+    if !delivered {
+      listItem.setImage(
+        makeArtworkPlaceholder(kind: placeholderKind, fitting: CPListItem.maximumImageSize))
+    }
+  }
+
   public func stopHandler() {
     guard self.completeHandler != nil else {
       return
     }
     self.completeHandler!()
     self.completeHandler = nil
+  }
+
+  /// Cheap bucket key over the row's visible content, used to pair a freshly
+  /// parsed row with an identical live one (see
+  /// `FCPListSection.reuseUnchangedItems`). Image bytes are keyed by length
+  /// only; `hasSameContent` does the exact comparison.
+  var contentKey: String {
+    return [
+      text ?? "", detailText ?? "", image ?? "", String(imageData?.data.count ?? -1),
+      placeholderKind ?? "", trailingImage ?? "", accessoryImage ?? "",
+    ].joined(separator: "\u{1F}")
+  }
+
+  /// Whether [other] would render exactly like this row.
+  func hasSameContent(as other: FCPListItem) -> Bool {
+    return text == other.text && detailText == other.detailText
+      && image == other.image && imageData?.data == other.imageData?.data
+      && imageTint == other.imageTint && placeholderKind == other.placeholderKind
+      && accessoryImage == other.accessoryImage && trailingImage == other.trailingImage
+      && trailingImageData?.data == other.trailingImageData?.data
+      && trailingImageTint == other.trailingImageTint
+      && playbackProgress == other.playbackProgress && isPlaying == other.isPlaying
+      && playingIndicatorLocation == other.playingIndicatorLocation
+      && accessoryType == other.accessoryType && isDownloaded == other.isDownloaded
+  }
+
+  /// Takes over [other]'s identity so this already-built row can stand in for
+  /// it: taps then report [other]'s element id, which is the one the Dart side
+  /// now holds. A selection still waiting on Dart will be completed under the
+  /// old id, which can no longer be found, so finish it here instead of
+  /// leaving the row's spinner running.
+  func adoptIdentity(of other: FCPListItem) {
+    stopHandler()
+    elementId = other.elementId
+    isOnPressListenerActive = other.isOnPressListenerActive
   }
 
   public func update(args: [String: Any]) {
@@ -136,11 +190,8 @@ final class FCPListItem {
 
     let imageTintChanged = imageTint != self.imageTint
     if let image = image, image != self.image || imageTintChanged {
-      self._super?.setImage(makeSafeArtworkPlaceholder(kind: placeholderKind))
-      loadUIImage(
-        from: image, bytes: imageData, tint: imageTint, placeholderKind: placeholderKind
-      ) { uiImage in
-        self._super?.setImage(uiImage)
+      if let listItem = self._super {
+        setArtwork(on: listItem, from: image, bytes: imageData, tint: imageTint)
       }
       self.image = image
       self.imageData = imageData

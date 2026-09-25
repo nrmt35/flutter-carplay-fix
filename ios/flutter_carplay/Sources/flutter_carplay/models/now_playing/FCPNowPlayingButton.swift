@@ -47,6 +47,23 @@ final class FCPNowPlayingButton {
     return [type, String(isSelected), repeatMode ?? "", image ?? ""].joined(separator: "|")
   }
 
+  /// Whether this on-screen button can be reused for [new] — i.e. both are
+  /// image buttons with the same image, so only `isSelected` can differ. Only
+  /// image buttons draw a custom selected state, and their image is read-only.
+  func canTakeOver(_ new: FCPNowPlayingButton) -> Bool {
+    return _super != nil && type == "image" && new.type == "image" && image == new.image
+  }
+
+  /// Makes this on-screen button stand in for [new]. Reusing the instance
+  /// keeps its CarPlay identifier, so when the row is re-sent the host reuses
+  /// the button's on-screen view instead of creating a new one — a new view
+  /// for every button was what made the whole row blink.
+  func takeOver(_ new: FCPNowPlayingButton) {
+    elementId = new.elementId
+    isSelected = new.isSelected
+    _super?.isSelected = new.isSelected
+  }
+
   private func handler(button: CPNowPlayingButton) {
     DispatchQueue.main.async {
       FCPStreamHandlerPlugin.sendEvent(
@@ -85,11 +102,39 @@ final class FCPNowPlayingButton {
       let uiImage =
         makeUIImage(fromBytes: imageData)
         ?? makeUIImage(from: (image ?? "").toImageSource())
-      button = CPNowPlayingImageButton(image: uiImage, handler: self.handler)
+      button = makeImageButton(image: uiImage)
     }
 
     button.isSelected = isSelected
     self._super = button
     return button
+  }
+
+  /// iOS 27's CPNowPlayingImageButton downsizes its image to
+  /// CPNowPlayingButtonMaximumImageSize (20pt) in the *source* image's scale,
+  /// then tags the result with the screen scale. Our rasterized PNGs are 1x,
+  /// so on a 3x phone the 120px glyph came out as 20px shown at 6.7pt — a
+  /// third of the iOS 26 size. Measured on the iOS 27 simulator: 20pt@1x and
+  /// 120pt@1x both end up 6.7pt@3x, while 20pt@3x stays 20pt@3x.
+  ///
+  /// The button's own `image.scale` tells us which scale it settled on, so
+  /// when that differs from ours, redraw at the maximum point size in that
+  /// scale and rebuild — the framework then has nothing left to rescale.
+  private func makeImageButton(image: UIImage) -> CPNowPlayingImageButton {
+    let button = CPNowPlayingImageButton(image: image, handler: self.handler)
+    guard let buttonScale = button.image?.scale, buttonScale != image.scale,
+      image.size.width > 0, image.size.height > 0
+    else { return button }
+
+    let maxSize = CPNowPlayingButtonMaximumImageSize
+    let ratio = min(1, maxSize.width / image.size.width, maxSize.height / image.size.height)
+    let size = CGSize(width: image.size.width * ratio, height: image.size.height * ratio)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = buttonScale
+    format.opaque = false
+    let rescaled = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+      image.draw(in: CGRect(origin: .zero, size: size))
+    }
+    return CPNowPlayingImageButton(image: rescaled, handler: self.handler)
   }
 }
